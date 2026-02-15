@@ -1,0 +1,45 @@
+# ZENO Phase 5 - Dependencies
+# Install with: pip install -r requirements.txt
+
+# ============================================================================
+# PHASE 5: Voice Input (STT) - faster-whisper (active)
+# ============================================================================
+faster-whisper
+pyaudio==0.2.13
+
+# Vosk (kept for fallback, currently unused)
+# vosk==0.3.45
+
+# Note for PyAudio on Windows:
+# If pip install fails, try:
+#   pip install pipwin
+#   pipwin install pyaudio
+
+# ============================================================================
+# PHASE 5: Voice Output (TTS)
+# ============================================================================
+pyttsx3==2.90
+
+# ============================================================================
+# PHASE 5: OS Control
+# ============================================================================
+
+# Volume control (Windows)
+pycaw==20230407
+comtypes==1.2.0
+
+# Brightness control (Windows laptops)
+wmi==1.5.1
+
+# ============================================================================
+# PHASE 5: Hotkey Detection
+# ============================================================================
+keyboard==0.13.5
+
+# ============================================================================
+# EXISTING DEPENDENCIES (Phase 4 and earlier)
+# ============================================================================
+# Add your existing dependencies here:
+# - LLM libraries (e.g., ollama, anthropic, etc.)
+# - Any other dependencies from Phaspipwin
+pyaudio
