@@ -64,7 +64,8 @@ ALLOWED_EXTENSIONS = {
     ".css",
     ".yaml",
     ".yml",
-    ".xml"
+    ".xml",
+    ".cpp"
 }
 
 # Maximum file size (200 KB)

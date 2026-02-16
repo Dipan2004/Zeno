@@ -1,5 +1,5 @@
 """
-ZENO Start - Main Entry Point with Full Phase 5 Support
+ZENO Start - Main Entry Point with Full Phase 6 Support
 
 This integrates:
 - Phase 1: Core Runtime (Orchestrator, TaskGraph)
@@ -8,12 +8,14 @@ This integrates:
 - Phase 3.5: Passive Reminders
 - Phase 4: System Execution (SystemAgent, DeveloperAgent)
 - Phase 5: Voice I/O (Push-to-Talk STT, TTS) + OS Control (Volume, Brightness)
+- Phase 6: Controlled Autonomy (AutonomyController) + Hybrid LLM (Kimi K2.5 + Ollama)
 
-Phase 5 additions (v2 fixes):
-- _voice_queue is now a thread-safe queue.Queue (was a plain list)
-- Voice callback uses put() not append() — no race condition
-- Main loop uses get_nowait() + Empty instead of pop(0)
-- Voice ready for repeated commands without restarting ZENO
+Phase 6 additions:
+- HybridLLM routes planner + code tasks to Kimi K2.5, falls back to Ollama
+- AutonomyController wraps slow-path execution for multi-step continuation
+- FastRouter now handles file-creation patterns (no LLM needed)
+- FastRouter CODE_PATTERNS now cover .cpp/.c/.js/.java/.rs/.go in addition to .py
+- All Phase 1-5 behavior preserved exactly
 """
 
 import logging
@@ -34,6 +36,10 @@ from zeno.agents import (
 from zeno.agents.reminder_agent import ReminderAgent
 from zeno.memory import ReminderStore
 from zeno.tools import file_system
+
+# Phase 6: Controlled Autonomy + Hybrid LLM
+from zeno.core.autonomy_controller import AutonomyController
+from zeno.llm.hybrid_llm import HybridLLM
 
 # Configure logging
 logging.basicConfig(
@@ -174,7 +180,7 @@ def main():
     """
     print("=" * 70)
     print("ZENO - Local AI Assistant")
-    print("Phase 5: Voice I/O + OS Control")
+    print("Phase 6: Controlled Autonomy + Hybrid LLM")
     print("=" * 70)
     print()
 
@@ -192,10 +198,16 @@ def main():
         reminder_store = ReminderStore()
         reminder_agent = ReminderAgent(reminder_store)
 
-        chat_agent      = ChatAgent(llm, reminder_agent=reminder_agent)
-        planner         = PlannerAgent(llm)
+        # Phase 6: HybridLLM wraps LocalLLM — ChatAgent stays on LocalLLM directly
+        hybrid_llm = HybridLLM(llm)
+
+        chat_agent      = ChatAgent(llm, reminder_agent=reminder_agent)   # unchanged
+        planner         = PlannerAgent(hybrid_llm)    # Phase 6: Kimi for planning
         system_agent    = SystemAgent()
-        developer_agent = DeveloperAgent(llm)
+        developer_agent = DeveloperAgent(hybrid_llm)  # Phase 6: Kimi for code gen
+
+        # Phase 6: AutonomyController wraps slow-path execution
+        autonomy = AutonomyController(orch, planner)
 
         orch.register_agent(AgentType.CHAT,      chat_agent)
         orch.register_agent(AgentType.SYSTEM,    system_agent)
@@ -397,7 +409,7 @@ def main():
 
             return
 
-        # SLOW PATH — LLM planner (unchanged from Phase 4)
+        # SLOW PATH — LLM planner → AutonomyController (Phase 6)
         print("\nZENO: Let me plan that...\n")
         context_snapshot = ctx.create_snapshot("planning")
 
@@ -407,7 +419,10 @@ def main():
             print(f"Plan: {explanation}\n")
             print("Executing...\n")
 
-            results       = orch.execute_plan(list(task_graph.tasks.values()))
+            # Phase 6: AutonomyController handles multi-step continuation
+            # FastRouter tasks bypass this path entirely (no change there)
+            results = autonomy.execute(task_graph, context_snapshot, user_input)
+
             success_count = sum(1 for r in results.values() if r.success)
             total_count   = len(results)
 
@@ -427,8 +442,11 @@ def main():
                 print(f"⚠  {success_count}/{total_count} tasks completed\n")
                 for task_id, result in results.items():
                     if not result.success:
-                        task = task_graph.get_task(task_id)
-                        print(f"  ✗ {task.name}: {result.error}")
+                        # task_graph only has the first step's tasks; for follow-up
+                        # steps the task object is not in task_graph, so guard safely
+                        task_obj = task_graph.tasks.get(task_id)
+                        name = task_obj.name if task_obj else task_id
+                        print(f"  ✗ {name}: {result.error}")
                 print()
 
             ctx.add_message("assistant", explanation)
@@ -438,34 +456,68 @@ def main():
             logger.error(f"Planning failed: {e}", exc_info=True)
 
     # =========================================================================
-    # Main loop
+    # Phase 5: Non-blocking input thread helper (avoids blocking on input())
+    # =========================================================================
+    input_queue: Queue = Queue()
+    input_ready_event = threading.Event()
+
+    def _input_thread_worker():
+        """Background thread that reads typed input non-blockingly"""
+        while True:
+            try:
+                line = input("You: ").strip()
+                input_queue.put(line)
+                input_ready_event.set()
+            except EOFError:
+                # stdin closed (e.g., redirected, piped, or script ended)
+                break
+            except Exception as e:
+                logger.debug(f"Input thread error: {e}")
+                break
+
+    # Start input thread as daemon (will die with main process)
+    input_thread = threading.Thread(target=_input_thread_worker, daemon=True)
+    input_thread.start()
+
+    # =========================================================================
+    # Main loop - now checks BOTH voice queue AND typed input queue
     # =========================================================================
     while True:
         try:
             # ------------------------------------------------------------------
-            # Phase 5: Drain voice queue (non-blocking, thread-safe)
+            # Phase 5: Priority 1 - Drain voice queue (high priority, no blocking)
             # ------------------------------------------------------------------
             try:
                 voice_text = _voice_queue.get_nowait()   # thread-safe, non-blocking
                 logger.info(f"Processing voice input: {voice_text}")
                 process_input(voice_text)
+                input_ready_event.clear()  # reset in case input was pending
                 continue
             except Empty:
-                pass  # nothing in queue, fall through to typed input
+                pass  # nothing in queue, check typed input next
 
             # ------------------------------------------------------------------
-            # Phase 4: Typed input (unchanged)
+            # Phase 4: Priority 2 - Check typed input (with timeout to allow
+            # checking voice queue periodically)
             # ------------------------------------------------------------------
-            user_input = input("You: ").strip()
+            try:
+                # Wait up to 0.1 seconds for typed input
+                # This allows voice queue to be checked ~10x per second
+                user_input = input_queue.get(timeout=0.1)
+                input_ready_event.clear()
 
-            if not user_input:
-                continue
+                if not user_input:
+                    continue
 
-            if user_input.lower() in ["quit", "exit", "q"]:
-                print("\nGoodbye!")
-                break
+                if user_input.lower() in ["quit", "exit", "q"]:
+                    print("\nGoodbye!")
+                    break
 
-            process_input(user_input)
+                process_input(user_input)
+
+            except Empty:
+                # No typed input yet - loop back to check voice queue again
+                pass
 
         except SystemExit:
             print("\nGoodbye!")

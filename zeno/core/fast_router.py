@@ -1,7 +1,8 @@
 """
-ZENO Fast Router - Enhanced with Code Generation + OS Control Detection
+ZENO Fast Router - Enhanced with Code Generation + OS Control + File Creation Detection
 
-Detects system commands, code generation, AND OS control tasks BEFORE calling PlannerAgent (LLM).
+Detects system commands, code generation, file creation AND OS control tasks
+BEFORE calling PlannerAgent (LLM).
 
 Performance Goal: < 50ms, ZERO LLM tokens for obvious tasks
 
@@ -10,17 +11,23 @@ Phase 5 Updates:
 - Brightness control pattern detection
 - Correct priority order to avoid conflicts
 
+Phase 6 Updates:
+- File creation patterns (create a cpp file, make a python file, new js file, etc.)
+- Extended CODE_PATTERNS to cover .cpp / .c / .js / .java / .rs / .go in addition to .py
+
 Architectural Rules:
 - Pure classifier only
 - NO execution logic
 - NO system tool calls
 - Returns Task or None
 
-Supported patterns:
-- "write <code> in <file>" → DeveloperAgent
-- "set volume to 50" → SystemAgent (NEW!)
-- "increase brightness" → SystemAgent (NEW!)
-- "open <target>" → SystemAgent
+Supported patterns (priority order):
+0. File creation  → DeveloperAgent  (NEW Phase 6)
+1. Code generation → DeveloperAgent
+2. Volume control → SystemAgent
+3. Brightness     → SystemAgent
+4. App / URL open → SystemAgent
+5. PlannerAgent fallback (return None)
 """
 
 import logging
@@ -82,16 +89,78 @@ KNOWN_SITES = {
 # COMMAND PATTERNS (PRIORITY ORDER MATTERS!)
 # ============================================================================
 
-# Code generation patterns (HIGHEST PRIORITY - Phase 4)
+# Language → extension mapping (used by both file and code patterns)
+LANGUAGE_MAP = {
+    "python": ".py",
+    "py":     ".py",
+    "javascript": ".js",
+    "js":     ".js",
+    "java":   ".java",
+    "cpp":    ".cpp",
+    "c++":    ".cpp",
+    "c":      ".c",
+    "rust":   ".rs",
+    "rs":     ".rs",
+    "go":     ".go",
+    "golang": ".go",
+    "html":   ".html",
+    "text":   ".txt",
+    "txt":    ".txt",
+}
+
+# Extension → language name (for payload)
+EXT_TO_LANG = {v: k for k, v in LANGUAGE_MAP.items()}
+EXT_TO_LANG.update({
+    ".py":   "python",
+    ".js":   "javascript",
+    ".cpp":  "cpp",
+    ".c":    "c",
+    ".rs":   "rust",
+    ".go":   "go",
+    ".java": "java",
+})
+
+# Phase 6: File creation patterns (HIGHEST PRIORITY — no code, just create the file)
+# Matches: "create a cpp file", "make a python file", "new js file", "generate file"
+FILE_PATTERNS = [
+    # "create a cpp file" / "make a python file" / "generate a js file" / "build a c file"
+    re.compile(
+        r"^(?:create|make|generate|build)\s+(?:a\s+|an\s+)?(\w+)\s+file$",
+        re.IGNORECASE,
+    ),
+    # "new python file" / "new cpp file"
+    re.compile(
+        r"^new\s+(\w+)\s+file$",
+        re.IGNORECASE,
+    ),
+    # "create file" / "make file" / "generate file" (language-less → default .py)
+    re.compile(
+        r"^(?:create|make|generate|build)\s+(?:a\s+|an\s+)?file$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^new\s+file$",
+        re.IGNORECASE,
+    ),
+]
+
+# Code generation patterns (SECOND PRIORITY - Phase 4, extended to all extensions)
 CODE_PATTERNS = [
-    # "write <code_description> in <filename>"
-    re.compile(r"^(?:write|create|generate)\s+(?:a\s+|an\s+)?(.+?)\s+(?:in|to|into)\s+(.+\.py)$", re.IGNORECASE),
-    
-    # "write <filename> with <code_description>"
-    re.compile(r"^(?:write|create|generate)\s+(.+\.py)\s+(?:with|containing|for)\s+(.+)$", re.IGNORECASE),
-    
-    # "in <filename> write <code_description>"
-    re.compile(r"^in\s+(.+\.py)\s+(?:write|create|add)\s+(?:a\s+|an\s+)?(.+)$", re.IGNORECASE),
+    # "write <code_description> in <filename>" — any extension
+    re.compile(
+        r"^(?:write|create|generate|w\w*write)\s+(?:a\s+|an\s+)?(.+?)\s+(?:in|to|into)\s+(.+\.\w+)$",
+        re.IGNORECASE,
+    ),
+    # "write <filename> with <code_description>" — any extension
+    re.compile(
+        r"^(?:write|create|generate|w\w*write)\s+(.+\.\w+)\s+(?:with|containing|for)\s+(.+)$",
+        re.IGNORECASE,
+    ),
+    # "in <filename> write <code_description>" — any extension
+    re.compile(
+        r"^in\s+(.+\.\w+)\s+(?:write|create|add|w\w*write)\s+(?:a\s+|an\s+)?(.+)$",
+        re.IGNORECASE,
+    ),
 ]
 
 # Volume control patterns (SECOND PRIORITY - Phase 5)
@@ -141,14 +210,15 @@ class FastRouter:
     def __init__(self):
         """Initialize fast router"""
         self._task_counter = 0
-        logger.info("FastRouter initialized (Phase 5: with OS control)")
+        logger.info("FastRouter initialized (Phase 6: file creation + OS control)")
     
     def try_route(self, user_input: str) -> Optional[Task]:
         """
         Attempt to classify user input as a fast-path task.
         
         Classification order (LOCKED):
-        1. Code generation (highest priority)
+        0. File creation patterns (Phase 6)   ← NEW
+        1. Code generation
         2. Volume control
         3. Brightness control
         4. App/URL open
@@ -159,17 +229,17 @@ class FastRouter:
             
         Returns:
             Task object if classified, None if no match
-            
-        Note:
-            - Returns None for unknown targets (falls back to LLM)
-            - Does NOT validate if apps exist or are installed
-            - Pure classification only
         """
         if not user_input or not user_input.strip():
             return None
         
-        # Normalize input
-        normalized = user_input.strip()
+        # Normalize input: strip whitespace and trailing punctuation
+        normalized = user_input.strip().rstrip('.!?;:,')
+        
+        # PRIORITY 0: File creation patterns (Phase 6)
+        file_task = self._try_file_pattern(normalized)
+        if file_task:
+            return file_task
         
         # PRIORITY 1: Code generation patterns (prevents "write volume control" → mute)
         code_task = self._try_code_pattern(normalized)
@@ -194,18 +264,90 @@ class FastRouter:
         # No match - fall back to LLM
         return None
     
-    def _try_code_pattern(self, user_input: str) -> Optional[Task]:
+    def _try_file_pattern(self, user_input: str) -> Optional[Task]:
         """
-        Try to match code generation patterns (Phase 4).
-        
+        Phase 6: Match file-creation patterns (no code generation, just create the file).
+
         Examples:
-        - "write bfs in route.py"
-        - "create sorting algorithm in sort.py"
-        - "in test.py write factorial function"
-        
+        - "create a cpp file"   → DeveloperAgent create_file, hello.cpp
+        - "make a python file"  → DeveloperAgent create_file, hello.py
+        - "new js file"         → DeveloperAgent create_file, hello.js
+        - "create a file"       → DeveloperAgent create_file, hello.py (default)
+        - "new file"            → DeveloperAgent create_file, hello.py (default)
+
         Args:
             user_input: Normalized user input
-            
+
+        Returns:
+            Task for DeveloperAgent (intent=create_file) or None
+        """
+        # Language-less patterns (last two in FILE_PATTERNS)
+        # Check index 2 and 3 first so we know if there's no language token
+        for pattern in FILE_PATTERNS[2:]:    # "create a file", "new file"
+            if pattern.match(user_input):
+                # Default to Python
+                self._task_counter += 1
+                logger.info("✅ File pattern matched (no language): default python")
+                return Task(
+                    id=f"fast-file-{self._task_counter}",
+                    name="Create new file",
+                    description="Create a new Python file",
+                    type=AgentType.DEVELOPER,
+                    payload={
+                        "intent": "create_file",
+                        "filename": "new_file.py",
+                        "description": "New Python file",
+                    },
+                )
+
+        # Language-bearing patterns (first two in FILE_PATTERNS)
+        for pattern in FILE_PATTERNS[:2]:    # "create a <lang> file", "new <lang> file"
+            match = pattern.match(user_input)
+            if match:
+                lang_token = match.group(1).lower()
+                extension  = LANGUAGE_MAP.get(lang_token)
+
+                if extension is None:
+                    # Unknown language token — let LLM handle it
+                    logger.debug(
+                        "File pattern matched but unknown language token '%s' — falling through",
+                        lang_token,
+                    )
+                    return None
+
+                language = EXT_TO_LANG.get(extension, lang_token)
+                filename = f"new_file{extension}"
+
+                self._task_counter += 1
+                logger.info(
+                    "✅ File pattern matched: %s → %s", lang_token, filename
+                )
+                return Task(
+                    id=f"fast-file-{self._task_counter}",
+                    name=f"Create new {language} file",
+                    description=f"Create a new {language} file",
+                    type=AgentType.DEVELOPER,
+                    payload={
+                        "intent": "create_file",
+                        "filename": filename,
+                        "description": f"New {language} file",
+                    },
+                )
+
+        return None
+
+    def _try_code_pattern(self, user_input: str) -> Optional[Task]:
+        """
+        Try to match code generation patterns (Phase 4, extended in Phase 6).
+
+        Examples:
+        - "write bfs in route.py"
+        - "create sorting algorithm in sort.cpp"
+        - "in test.py write factorial function"
+
+        Args:
+            user_input: Normalized user input
+
         Returns:
             Task for DeveloperAgent or None
         """
@@ -213,46 +355,35 @@ class FastRouter:
             match = pattern.match(user_input)
             if match:
                 groups = match.groups()
-                
-                # Different patterns have different group orders
-                if groups[0].endswith('.py'):
-                    # Pattern 2 or 3: filename is first
-                    filename = groups[0]
+
+                # Detect which group holds the filename (has a dot extension)
+                def has_extension(s: str) -> bool:
+                    return bool(re.search(r'\.\w+$', s))
+
+                if has_extension(groups[0]):
+                    filename        = groups[0]
                     code_description = groups[1] if len(groups) > 1 else "code"
                 else:
-                    # Pattern 1: description is first
                     code_description = groups[0]
-                    filename = groups[1] if len(groups) > 1 else "output.py"
-                
+                    filename        = groups[1] if len(groups) > 1 else "output.py"
+
                 logger.info(f"✅ Code pattern matched: {code_description} → {filename}")
                 return self._create_code_task(code_description, filename)
-        
+
         return None
     
     def _create_code_task(self, code_description: str, filename: str) -> Task:
         """
         Create task with payload matching DeveloperAgent expectations.
-        
-        Args:
-            code_description: What to generate (e.g., "bfs algorithm")
-            filename: Target file (e.g., "route.py")
-            
-        Returns:
-            Task ready for DeveloperAgent
+        Handles all extensions, not just .py.
         """
         self._task_counter += 1
-        
-        # Extract language from filename
-        language = "python"  # Default
-        if filename.endswith('.js'):
-            language = "javascript"
-        elif filename.endswith('.java'):
-            language = "java"
-        elif filename.endswith('.cpp'):
-            language = "cpp"
-        elif filename.endswith('.c'):
-            language = "c"
-        
+
+        # Extract extension and map to language name
+        import os as _os
+        ext      = _os.path.splitext(filename)[1].lower()
+        language = EXT_TO_LANG.get(ext, "python")   # default python
+
         return Task(
             id=f"fast-code-{self._task_counter}",
             name=f"Generate {code_description}",
@@ -262,8 +393,8 @@ class FastRouter:
                 "intent": "generate_code",
                 "description": f"Write {code_description}",
                 "language": language,
-                "filename": filename
-            }
+                "filename": filename,
+            },
         )
     
     def _try_volume_pattern(self, user_input: str) -> Optional[Task]:
@@ -482,10 +613,15 @@ class FastRouter:
     def get_supported_commands(self) -> list[str]:
         """Get list of supported command patterns"""
         return [
+            # File creation (Phase 6)
+            "create a <language> file",
+            "make a <language> file",
+            "new <language> file",
+            "create a file",
             # Code generation
-            "write <description> in <file.py>",
-            "create <description> in <file.py>",
-            "in <file.py> write <description>",
+            "write <description> in <file>",
+            "create <description> in <file>",
+            "in <file> write <description>",
             # OS control (Phase 5)
             "set volume to <0-100>",
             "increase volume",

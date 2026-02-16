@@ -1,1 +1,6 @@
 /models
+/.env
+/node_modules
+/venv
+/venv/
+/workspace

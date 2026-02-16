@@ -342,7 +342,8 @@ You are OFFLINE and cannot access external libraries not in standard library."""
             model=QWEN_3B_INSTRUCT,
             temperature=0.3,  # Lower for more deterministic code
             max_tokens=1000,
-            timeout=50
+            timeout=50,
+            role="code",       # Phase 6: tells HybridLLM to use Kimi K2.5
         )
         
         # Clean response (remove markdown if present)

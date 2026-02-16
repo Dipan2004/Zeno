@@ -261,7 +261,8 @@ Now process the user's command."""
                 model=QWEN_3B_INSTRUCT,
                 temperature=0.3,  # Lower for more deterministic planning
                 max_tokens=1200,  # Reduced for smaller model efficiency
-                timeout=120
+                timeout=120,
+                role="planner",   # Phase 6: tells HybridLLM to use Kimi K2.5
             )
             
             # Parse JSON response
@@ -509,6 +510,103 @@ Now process the user's command."""
         
         return type_map[type_upper]
     
+    # =========================================================================
+    # Phase 6: Autonomy support methods
+    # Called by AutonomyController — do NOT call directly from start.py
+    # =========================================================================
+
+    def is_complete(self, results: dict) -> bool:
+        """
+        Decide whether the work is finished based on the last execution results.
+
+        Conservative heuristic (no LLM call — fast):
+        - If ALL tasks succeeded → complete.
+        - If ANY task failed     → also considered "complete" (stop, don't retry).
+        - If results is empty    → complete (nothing left to do).
+
+        The AutonomyController already stops on failure, so the second case is
+        a safety net. Override this method if you need richer logic later.
+
+        Args:
+            results: Dict[task_id → TaskResult] from the last orch.execute_plan()
+
+        Returns:
+            True  → AutonomyController should stop.
+            False → AutonomyController should call plan_followup().
+        """
+        if not results:
+            logger.debug("is_complete: no results — treating as complete")
+            return True
+
+        all_success = all(r.success for r in results.values())
+
+        # Check whether any result has data indicating more work is needed.
+        # Agents can signal this by setting result.metadata["needs_followup"] = True.
+        needs_followup = any(
+            r.metadata.get("needs_followup", False)
+            for r in results.values()
+            if r.success and r.metadata
+        )
+
+        if all_success and not needs_followup:
+            logger.debug("is_complete: all tasks succeeded, no follow-up needed")
+            return True
+
+        if all_success and needs_followup:
+            logger.debug("is_complete: all tasks succeeded, follow-up requested")
+            return False
+
+        # Some tasks failed — stop (AutonomyController also checks this)
+        logger.debug("is_complete: some tasks failed — stopping")
+        return True
+
+    def plan_followup(
+        self,
+        results: dict,
+        context_snapshot,
+        original_input: str,
+    ):
+        """
+        Create a follow-up task graph based on the previous step's results.
+
+        Only called when is_complete() returned False.
+        Uses the same LLM path as plan() with a follow-up prompt.
+
+        Args:
+            results:        Dict[task_id → TaskResult] from previous step.
+            context_snapshot: ContextSnapshot (same one passed to plan()).
+            original_input: Original user command.
+
+        Returns:
+            Tuple of (TaskGraph, explanation) — same shape as plan().
+
+        Raises:
+            PlanningError: If follow-up planning fails.
+        """
+        logger.info("plan_followup: generating follow-up plan...")
+
+        # Build a summary of what was completed so far
+        completed_summaries = []
+        for tid, result in results.items():
+            if result.success and result.data:
+                msg = result.data.get("message") or result.data.get("filename") or tid
+                completed_summaries.append(f"- Completed: {msg}")
+
+        completed_text = (
+            "\n".join(completed_summaries)
+            if completed_summaries
+            else "- (no completed tasks)"
+        )
+
+        followup_input = (
+            f"Original request: {original_input}\n\n"
+            f"The following steps have already been completed:\n{completed_text}\n\n"
+            f"What still needs to be done to fully complete the original request? "
+            f"If everything is done, return a single CHAT task saying it is complete."
+        )
+
+        return self.plan(followup_input, context_snapshot)
+
     def reset_counter(self):
         """Reset task counter (useful for testing)"""
         self._task_counter = 0
