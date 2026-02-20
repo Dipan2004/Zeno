@@ -21,6 +21,8 @@ Design:
 - Any exception from Kimi triggers silent fallback to LocalLLM.
 - NVIDIA NIM endpoint is used (change KIMI_BASE_URL to suit your setup).
 """
+import requests
+
 
 import logging
 import os
@@ -117,7 +119,8 @@ class HybridLLM:
         model: str = QWEN_3B_INSTRUCT,
         temperature: float = 0.7,
         max_tokens: int = 1000,
-        timeout: int = 60,
+        kimi_timeout: int = 90,
+        local_timeout: int = 120,
         role: str = "chat",          # NEW: callers pass role="planner" / role="code"
         **kwargs,
     ):
@@ -129,23 +132,29 @@ class HybridLLM:
         - All other roles, or Kimi failure → LocalLLM
 
         Args:
-            prompt:      Full prompt string.
-            model:       Ollama model name (used only when falling back to LocalLLM).
-            temperature: Sampling temperature.
-            max_tokens:  Token budget for the response.
-            timeout:     Seconds before giving up on Kimi.
-            role:        "planner", "code", or "chat".
+            prompt:       Full prompt string.
+            model:        Ollama model name (used only when falling back to LocalLLM).
+            temperature:  Sampling temperature.
+            max_tokens:   Token budget for the response.
+            kimi_timeout:  Seconds before giving up on Kimi (default 90).
+            local_timeout: Seconds before giving up on LocalLLM (default 120).
+            role:         "planner", "code", or "chat".
 
         Returns:
             Object with a .text attribute containing the generated string.
         """
+        # Strip caller-supplied 'timeout' from kwargs so it doesn't clash
+        # with the explicit timeout= we pass to LocalLLM below
+        kwargs.pop("timeout", None)
+
         if self._kimi_available and role in KIMI_ROLES:
             try:
                 return self._kimi_generate(
                     prompt=prompt,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    timeout=timeout,
+                    timeout=kimi_timeout,
+                    
                 )
             except Exception as e:
                 logger.warning(
@@ -159,7 +168,7 @@ class HybridLLM:
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
-            timeout=timeout,
+            timeout=local_timeout,
             **kwargs,
         )
 
@@ -184,21 +193,52 @@ class HybridLLM:
                 "Run: pip install openai"
             ) from e
 
-        client = OpenAI(
-            base_url=KIMI_BASE_URL,
-            api_key=KIMI_API_KEY,
-        )
-
         logger.debug("HybridLLM: sending request to Kimi K2.5...")
 
-        response = client.chat.completions.create(
-            model=KIMI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-        )
+        # =====================================================================
+        # NVIDIA API Catalog requires raw HTTP instead of OpenAI SDK
+        # =====================================================================
+        if "integrate.api.nvidia.com" in KIMI_BASE_URL:
 
-        text = response.choices[0].message.content or ""
+            invoke_url = f"{KIMI_BASE_URL}/chat/completions"
+
+            headers = {
+                "Authorization": f"Bearer {KIMI_API_KEY}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+
+            payload = {
+                "model": KIMI_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "chat_template_kwargs": {"thinking": True},
+                "stream": False,
+            }
+
+            resp = requests.post(invoke_url, headers=headers, json=payload, timeout=timeout)
+            resp.raise_for_status()
+
+            data = resp.json()
+            text = data["choices"][0]["message"]["content"] or ""
+
+        else:
+            # Keep original OpenAI SDK logic for non-NVIDIA endpoints
+            client = OpenAI(
+                base_url=KIMI_BASE_URL,
+                api_key=KIMI_API_KEY,
+            )
+
+            response = client.chat.completions.create(
+                model=KIMI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+
+            text = response.choices[0].message.content or ""
+
         logger.debug("HybridLLM: Kimi responded (%d chars)", len(text))
         return KimiResponse(text=text)

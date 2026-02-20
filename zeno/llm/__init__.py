@@ -13,6 +13,7 @@ from .local_llm import (
     OllamaTimeoutError,
     OllamaInvalidResponseError,
     QWEN_3B_INSTRUCT,
+    LLAMA_1B_INSTRUCT,
     LLAMA3_3B,
     MISTRAL_7B,
     QWEN_CODER
@@ -27,6 +28,7 @@ __all__ = [
     'OllamaTimeoutError',
     'OllamaInvalidResponseError',
     'QWEN_3B_INSTRUCT',
+    'LLAMA_1B_INSTRUCT',
     'LLAMA3_3B',
     'MISTRAL_7B',
     'QWEN_CODER',

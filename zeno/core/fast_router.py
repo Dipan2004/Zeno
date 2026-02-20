@@ -15,6 +15,9 @@ Phase 6 Updates:
 - File creation patterns (create a cpp file, make a python file, new js file, etc.)
 - Extended CODE_PATTERNS to cover .cpp / .c / .js / .java / .rs / .go in addition to .py
 
+Phase 6.5 Updates:
+- Chat intent detection (looks_like_chat) - bypasses planner for conversational queries
+
 Architectural Rules:
 - Pure classifier only
 - NO execution logic
@@ -27,7 +30,8 @@ Supported patterns (priority order):
 2. Volume control → SystemAgent
 3. Brightness     → SystemAgent
 4. App / URL open → SystemAgent
-5. PlannerAgent fallback (return None)
+5. Chat detection → ChatAgent (NEW Phase 6.5)
+6. PlannerAgent fallback (return None)
 """
 
 import logging
@@ -83,6 +87,82 @@ KNOWN_SITES = {
     "github", "google", "youtube", "stackoverflow",
     "twitter", "reddit",
 }
+
+
+# ============================================================================
+# CHAT INTENT DETECTION (HYBRID GATE)
+# ============================================================================
+
+# Task verbs that indicate non-chat intents
+TASK_VERBS = {
+    "create", "build", "generate", "make", "write", "code", "open", "launch",
+    "start", "run", "execute", "compile", "install", "download", "upload",
+    "delete", "remove", "move", "copy", "rename", "edit", "modify", "update",
+    "search", "find", "list", "show", "display", "print", "save", "load",
+    "set", "get", "increase", "decrease", "mute", "unmute", "close", "kill",
+}
+
+
+def looks_like_chat(text: str) -> bool:
+    """
+    Lightweight heuristic to detect conversational chat vs task requests.
+    
+    NO LLM calls. Pure pattern matching.
+    
+    Returns True if input looks like casual chat that should go to ChatAgent.
+    Returns False if input looks like it needs planning/execution.
+    
+    Heuristics:
+    - Short inputs (≤4 words) without task verbs → likely chat
+    - Question patterns without task verbs → likely chat
+    - Conversational greetings/responses → chat
+    - Contains task verbs → NOT chat
+    - File/code-related keywords → NOT chat
+    
+    Examples returning True (chat):
+        "hello", "hi there", "what's up", "how are you",
+        "tell me about arrays", "explain bfs", "what is python"
+    
+    Examples returning False (task):
+        "create python file", "write bfs code", "open chrome",
+        "generate backend architecture"
+    """
+    if not text or not text.strip():
+        return False
+    
+    normalized = text.strip().lower()
+    words = normalized.split()
+    word_count = len(words)
+    
+    # Check for task verbs (strong indicator of non-chat intent)
+    if any(verb in words for verb in TASK_VERBS):
+        return False
+    
+    # Check for file/code indicators (non-chat)
+    code_indicators = ["file", ".py", ".js", ".cpp", ".c", ".java", ".go", ".rs"]
+    if any(indicator in normalized for indicator in code_indicators):
+        return False
+    
+    # Short inputs without task verbs are likely chat
+    if word_count <= 4:
+        return True
+    
+    # Question patterns (even if longer) are likely chat if no task verbs
+    question_starters = ["what", "why", "how", "when", "where", "who", "which", "can you explain", "tell me", "do you"]
+    if any(normalized.startswith(starter) for starter in question_starters):
+        return True
+    
+    # Common greetings/conversational phrases
+    greetings = ["hello", "hi", "hey", "yo", "sup", "good morning", "good evening"]
+    if any(greeting in normalized for greeting in greetings):
+        return True
+    
+    # If we reach here with short text, lean toward chat
+    if word_count <= 6:
+        return True
+    
+    # Longer text without clear indicators → fall through to planner (safer)
+    return False
 
 
 # ============================================================================
@@ -148,17 +228,17 @@ FILE_PATTERNS = [
 CODE_PATTERNS = [
     # "write <code_description> in <filename>" — any extension
     re.compile(
-        r"^(?:write|create|generate|w\w*write)\s+(?:a\s+|an\s+)?(.+?)\s+(?:in|to|into)\s+(.+\.\w+)$",
+        r"^(?:write|create|generate)\s+(?:a\s+|an\s+)?(.+?)\s+(?:in|to|into)\s+(.+\.\w+)$",
         re.IGNORECASE,
     ),
     # "write <filename> with <code_description>" — any extension
     re.compile(
-        r"^(?:write|create|generate|w\w*write)\s+(.+\.\w+)\s+(?:with|containing|for)\s+(.+)$",
+        r"^(?:write|create|generate)\s+(.+\.\w+)\s+(?:with|containing|for)\s+(.+)$",
         re.IGNORECASE,
     ),
     # "in <filename> write <code_description>" — any extension
     re.compile(
-        r"^in\s+(.+\.\w+)\s+(?:write|create|add|w\w*write)\s+(?:a\s+|an\s+)?(.+)$",
+        r"^in\s+(.+\.\w+)\s+(?:write|create|add)\s+(?:a\s+|an\s+)?(.+)$",
         re.IGNORECASE,
     ),
 ]
@@ -202,6 +282,7 @@ class FastRouter:
     Pure rule-based classifier for system commands, code generation, and OS control.
     
     Phase 5 Enhanced: Now detects volume/brightness control.
+    Phase 6.5 Enhanced: Now detects chat intent.
     
     Bypasses LLM for obvious system actions and code requests.
     Does NOT execute - only classifies and creates Tasks.
@@ -210,14 +291,14 @@ class FastRouter:
     def __init__(self):
         """Initialize fast router"""
         self._task_counter = 0
-        logger.info("FastRouter initialized (Phase 6: file creation + OS control)")
+        logger.info("FastRouter initialized (Phase 6.5: file creation + OS control + chat gate)")
     
     def try_route(self, user_input: str) -> Optional[Task]:
         """
         Attempt to classify user input as a fast-path task.
         
         Classification order (LOCKED):
-        0. File creation patterns (Phase 6)   ← NEW
+        0. File creation patterns (Phase 6)
         1. Code generation
         2. Volume control
         3. Brightness control
@@ -261,7 +342,7 @@ class FastRouter:
         if target:
             return self._classify_and_create_task(target)
         
-        # No match - fall back to LLM
+        # No match - fall back to chat gate or planner
         return None
     
     def _try_file_pattern(self, user_input: str) -> Optional[Task]:

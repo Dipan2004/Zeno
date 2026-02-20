@@ -9,13 +9,13 @@ This integrates:
 - Phase 4: System Execution (SystemAgent, DeveloperAgent)
 - Phase 5: Voice I/O (Push-to-Talk STT, TTS) + OS Control (Volume, Brightness)
 - Phase 6: Controlled Autonomy (AutonomyController) + Hybrid LLM (Kimi K2.5 + Ollama)
+- Phase 6.5: Chat Gate (lightweight intent detection, bypasses planner for chat)
 
-Phase 6 additions:
-- HybridLLM routes planner + code tasks to Kimi K2.5, falls back to Ollama
-- AutonomyController wraps slow-path execution for multi-step continuation
-- FastRouter now handles file-creation patterns (no LLM needed)
-- FastRouter CODE_PATTERNS now cover .cpp/.c/.js/.java/.rs/.go in addition to .py
-- All Phase 1-5 behavior preserved exactly
+Phase 6.5 additions:
+- looks_like_chat() heuristic bypasses PlannerAgent for conversational queries
+- Saves Kimi API calls for simple questions like "hello", "what is bfs"
+- ChatAgent uses LocalLLM directly (no Kimi, fast responses)
+- All Phase 1-6 behavior preserved exactly
 """
 
 import logging
@@ -26,6 +26,7 @@ from queue import Queue, Empty
 from typing import Optional
 
 from zeno.core import ContextManager, Orchestrator, AgentType, Task, FastRouter
+from zeno.core.fast_router import looks_like_chat
 from zeno.llm import LocalLLM, QWEN_3B_INSTRUCT
 from zeno.agents import (
     ChatAgent,
@@ -48,9 +49,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Phase 5: Optional voice imports — ZENO boots fine without them
-# ============================================================================
+
 
 _VOICE_AVAILABLE  = False
 _HOTKEY_AVAILABLE = False
@@ -72,9 +71,7 @@ except ImportError:
     logger.warning("keyboard library not found — run: pip install keyboard")
 
 
-# ============================================================================
-# Phase 4: Reminder helper (UNCHANGED)
-# ============================================================================
+
 
 def check_and_surface_reminders(
     reminder_agent: "ReminderAgent",
@@ -113,9 +110,7 @@ def check_and_surface_reminders(
         return False
 
 
-# ============================================================================
-# Phase 5: Result → short spoken sentence
-# ============================================================================
+
 
 def format_result_for_speech(result) -> Optional[str]:
     """
@@ -169,24 +164,22 @@ def format_result_for_speech(result) -> Optional[str]:
     return None
 
 
-# ============================================================================
-# MAIN
-# ============================================================================
+
 
 def main():
     """
     Main ZENO entry point — Phase 4 logic preserved exactly,
-    Phase 5 voice layered on top as an optional I/O channel.
+    Phase 5 voice layered on top as an optional I/O channel,
+    Phase 6 autonomy + hybrid LLM,
+    Phase 6.5 chat gate for fast conversational responses.
     """
     print("=" * 70)
     print("ZENO - Local AI Assistant")
-    print("Phase 6: Controlled Autonomy + Hybrid LLM")
+    print("Phase 6.5: Chat Gate + Controlled Autonomy + Hybrid LLM")
     print("=" * 70)
     print()
 
-    # -------------------------------------------------------------------------
-    # Phase 4: Initialize core (UNCHANGED)
-    # -------------------------------------------------------------------------
+    
     try:
         logger.info("Initializing ZENO...")
 
@@ -228,15 +221,10 @@ def main():
         print(f"  2. Model is pulled   (ollama pull {QWEN_3B_INSTRUCT})")
         return 1
 
-    # -------------------------------------------------------------------------
-    # Phase 5: Thread-safe voice queue
-    # Using queue.Queue instead of a plain list — safe for cross-thread put/get
-    # -------------------------------------------------------------------------
+    
     _voice_queue: Queue = Queue()
 
-    # -------------------------------------------------------------------------
-    # Phase 5: Voice output (TTS)
-    # -------------------------------------------------------------------------
+    
     voice_output: Optional["VoiceOutputManager"] = None
     voice_input:  Optional["VoiceInputManager"]  = None
 
@@ -271,9 +259,7 @@ def main():
             logger.warning(f"STT init failed: {e}")
             voice_input = None
 
-    # -------------------------------------------------------------------------
-    # Phase 5: Ctrl+Space hotkey
-    # -------------------------------------------------------------------------
+    
     if _HOTKEY_AVAILABLE and voice_input is not None:
         def _on_hotkey():
             if not voice_input.is_listening():
@@ -286,22 +272,16 @@ def main():
         except Exception as e:
             logger.warning(f"Hotkey registration failed: {e}")
 
-    # -------------------------------------------------------------------------
-    # Status summary
-    # -------------------------------------------------------------------------
+    
     print()
     print(f"  Voice output : {'enabled' if voice_output else 'disabled (pip install pyttsx3)'}")
     print(f"  Voice input  : {'enabled' if voice_input  else 'disabled (pip install faster-whisper pyaudio)'}")
     print()
 
-    # -------------------------------------------------------------------------
-    # Phase 4: Passive reminder check on startup (UNCHANGED)
-    # -------------------------------------------------------------------------
+    
     check_and_surface_reminders(reminder_agent, chat_agent)
 
-    # -------------------------------------------------------------------------
-    # Help text
-    # -------------------------------------------------------------------------
+    
     print("Commands:")
     print("  - Type your message  (e.g., 'open vscode', 'write a python function')")
     print("  - 'set volume to 70' / 'increase brightness'  (Phase 5 OS control)")
@@ -312,10 +292,7 @@ def main():
     print("  - 'quit'             - Exit ZENO")
     print()
 
-    # =========================================================================
-    # Unified input processor
-    # All input — typed or voice — flows through this single function.
-    # =========================================================================
+    
 
     def process_input(user_input: str):
         user_input = user_input.strip()
@@ -409,6 +386,28 @@ def main():
 
             return
 
+        # CHAT GATE — Phase 6.5: lightweight conversational intent detection
+        # Bypasses PlannerAgent (and Kimi) for simple chat
+        if looks_like_chat(user_input):
+            logger.info("Chat gate: routing to ChatAgent (no planning needed)")
+            context_snapshot = ctx.create_snapshot("chat")
+            
+            try:
+                # ChatAgent uses LocalLLM directly (not HybridLLM)
+                response = chat_agent.respond(user_input, context_snapshot)
+                print(f"\nZENO: {response}\n")
+                
+                if voice_output:
+                    voice_output.speak(response)
+                
+                ctx.add_message("assistant", response)
+                return
+                
+            except Exception as e:
+                logger.error(f"Chat failed: {e}", exc_info=True)
+                print(f"Error: {e}\n")
+                return
+
         # SLOW PATH — LLM planner → AutonomyController (Phase 6)
         print("\nZENO: Let me plan that...\n")
         context_snapshot = ctx.create_snapshot("planning")
@@ -455,9 +454,7 @@ def main():
             print(f"Planning error: {e}\n")
             logger.error(f"Planning failed: {e}", exc_info=True)
 
-    # =========================================================================
-    # Phase 5: Non-blocking input thread helper (avoids blocking on input())
-    # =========================================================================
+    
     input_queue: Queue = Queue()
     input_ready_event = threading.Event()
 
@@ -479,14 +476,10 @@ def main():
     input_thread = threading.Thread(target=_input_thread_worker, daemon=True)
     input_thread.start()
 
-    # =========================================================================
-    # Main loop - now checks BOTH voice queue AND typed input queue
-    # =========================================================================
+    
     while True:
         try:
-            # ------------------------------------------------------------------
-            # Phase 5: Priority 1 - Drain voice queue (high priority, no blocking)
-            # ------------------------------------------------------------------
+            
             try:
                 voice_text = _voice_queue.get_nowait()   # thread-safe, non-blocking
                 logger.info(f"Processing voice input: {voice_text}")
@@ -496,10 +489,7 @@ def main():
             except Empty:
                 pass  # nothing in queue, check typed input next
 
-            # ------------------------------------------------------------------
-            # Phase 4: Priority 2 - Check typed input (with timeout to allow
-            # checking voice queue periodically)
-            # ------------------------------------------------------------------
+            
             try:
                 # Wait up to 0.1 seconds for typed input
                 # This allows voice queue to be checked ~10x per second
@@ -529,9 +519,7 @@ def main():
             logger.error(f"Error in main loop: {e}", exc_info=True)
             print(f"\nError: {e}\n")
 
-    # =========================================================================
-    # Phase 5: Clean shutdown
-    # =========================================================================
+    
     if voice_input is not None:
         try:
             voice_input.shutdown()

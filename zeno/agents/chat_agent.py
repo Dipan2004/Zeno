@@ -17,7 +17,7 @@ from typing import Optional , Any
 from datetime import datetime
 
 from zeno.core import Agent, Task, TaskResult, ContextSnapshot, AgentType
-from zeno.llm import LocalLLM, QWEN_3B_INSTRUCT, OllamaError
+from zeno.llm import LocalLLM, QWEN_3B_INSTRUCT, LLAMA_1B_INSTRUCT, OllamaError
 
 logger = logging.getLogger(__name__)
 
@@ -177,12 +177,24 @@ Remember: You are a LOCAL assistant running on the user's computer. Be genuinely
             # The actual reminder creation happens elsewhere after "yes"
         
         try:
-            # Build prompt with conversation history
-            prompt = self._build_chat_prompt(
-                user_message=user_message,
-                context_snapshot=context_snapshot,
-                additional_context=additional_context
-            )
+            # Build prompt — lightweight for short inputs, full for longer ones
+            word_count = len(user_message.split())
+            if word_count <= 6 and not additional_context:
+                prompt = (
+                    "You are ZENO, a friendly AI assistant.\n"
+                    f"User: {user_message}\n"
+                    "Assistant:"
+                )
+                chat_model = LLAMA_1B_INSTRUCT
+                logger.info(f"Using lightweight prompt ({len(prompt)} chars) with {chat_model}")
+            else:
+                prompt = self._build_chat_prompt(
+                    user_message=user_message,
+                    context_snapshot=context_snapshot,
+                    additional_context=additional_context
+                )
+                chat_model = LLAMA_1B_INSTRUCT
+                logger.info(f"Using full prompt ({len(prompt)} chars) with {chat_model}")
             
             # Check for interruption before LLM call
             if interrupt_event.is_set():
@@ -196,10 +208,10 @@ Remember: You are a LOCAL assistant running on the user's computer. Be genuinely
             logger.debug("Generating chat response...")
             response = self.llm.generate(
                 prompt=prompt,
-                model=QWEN_3B_INSTRUCT,
+                model=chat_model,
                 temperature=0.7,  # Higher for more natural, empathetic conversation
-                max_tokens=500,
-                timeout=120
+                max_tokens=300,
+                timeout=60
             )
             
             # Check for interruption after LLM call

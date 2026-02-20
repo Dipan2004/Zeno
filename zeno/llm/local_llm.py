@@ -38,6 +38,7 @@ MISTRAL_7B = "mistral"  # 7B - High RAM requirement (~8GB) - legacy
 QWEN_CODER = "qwen2.5-coder"  # For code generation (Phase 4+)
 LLAMA3_3B = "llama3.2:3b"  # 3B - Low RAM - deprecated, llama3.2 has compatibility issues
 QWEN_3B_INSTRUCT = "qwen2.5:3b-instruct-q4_0"  # 3B quantized - CURRENT RECOMMENDED MODEL
+LLAMA_1B_INSTRUCT = "llama3.2:1b"               # 1B - Ultra-fast chat model
 
 
 class OllamaError(Exception):
